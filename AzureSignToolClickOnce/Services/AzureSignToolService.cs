@@ -15,9 +15,13 @@ namespace AzureSignToolClickOnce.Services
 {
     public class AzureSignToolService
     {
-        private string _magetoolPath = @"C:\Program Files (x86)\Microsoft SDKs\Windows\v10.0A\bin\NETFX 4.8 Tools\mage.exe";
+        private const string DotnetMageVersion = "9.0.0";
+        
         public void Start(string description, string path, string timeStampUrl, string timeStampUrlRfc3161, string keyVaultUrl, string tenantId, string clientId, string clientSecret, string certName)
         {
+            // Ensure dotnet-mage is installed before proceeding
+            EnsureDotnetMageInstalled();
+
             var tokenCredential = new ClientSecretCredential(tenantId, clientId, clientSecret);
             var client = new CertificateClient(vaultUri: new Uri(keyVaultUrl), credential: tokenCredential);
             var cert = client.GetCertificate(certName).Value;
@@ -52,6 +56,14 @@ namespace AzureSignToolClickOnce.Services
                 {
                     FileInfo info = new FileInfo(filename);
                     string newName = filename.Substring(0, filename.Length - 7);
+                    
+                    // If target file already exists, delete it first
+                    if (File.Exists(newName))
+                    {
+                        Console.WriteLine($"Target file already exists, deleting: {newName}");
+                        File.Delete(newName);
+                    }
+                    
                     info.MoveTo(newName);
                     deployFiles.Add(newName);
                     files.Add(newName);
@@ -66,11 +78,42 @@ namespace AzureSignToolClickOnce.Services
             var setupExe = files.Where(f => ".exe".Equals(Path.GetExtension(f), StringComparison.OrdinalIgnoreCase));
             filesToSign.AddRange(setupExe);
 
-            var manifestFile = files.SingleOrDefault(f => ".manifest".Equals(Path.GetExtension(f), StringComparison.OrdinalIgnoreCase));
-            if (string.IsNullOrEmpty(manifestFile))
+            // Find manifest files - there might be multiple in different version folders
+            var manifestFiles = files.Where(f => ".manifest".Equals(Path.GetExtension(f), StringComparison.OrdinalIgnoreCase)).ToList();
+            
+            if (manifestFiles.Count == 0)
             {
                 Console.WriteLine("No manifest file found");
                 return;
+            }
+            
+            if (manifestFiles.Count > 1)
+            {
+                Console.WriteLine($"Warning: Found {manifestFiles.Count} manifest files:");
+                foreach (var mf in manifestFiles)
+                {
+                    Console.WriteLine($"  - {mf}");
+                }
+            }
+            
+            // Select the appropriate manifest file:
+            // 1. Prefer manifest files in the root publish directory (not in Application Files subdirectory)
+            // 2. If multiple manifests in Application Files, select from the most recent version folder
+            var rootManifests = manifestFiles.Where(f => !f.Contains(@"\Application Files\")).ToList();
+            
+            string manifestFile;
+            if (rootManifests.Any())
+            {
+                // Use the root manifest if available
+                manifestFile = rootManifests.First();
+                Console.WriteLine($"Using root manifest file: {manifestFile}");
+            }
+            else
+            {
+                // No root manifest, so select from Application Files
+                // Sort by path descending to get the latest version (assuming version folders sort alphabetically)
+                manifestFile = manifestFiles.OrderByDescending(f => f).First();
+                Console.WriteLine($"Using manifest from Application Files (latest version): {manifestFile}");
             }
 
             // sign the exe files
@@ -79,7 +122,7 @@ namespace AzureSignToolClickOnce.Services
             // look for the manifest file and sign that
             var args = "-a sha256RSA";
             var fileArgs = $@"-update ""{manifestFile}"" {args}";
-            if (!RunMageTool(fileArgs, manifestFile, rsa, certificate, timeStampUrl))
+            if (!RunDotnetMageTool(fileArgs, manifestFile, rsa, certificate, timeStampUrl))
                 return;
 
             // Now sign the inner vsto/clickonce file
@@ -98,7 +141,7 @@ namespace AzureSignToolClickOnce.Services
             foreach (var f in clickOnceFilesToSign)
             {
                 fileArgs = $@"-update ""{f}"" {args} -appm ""{manifestFile}"" -appc ""{manifestRelativePath}""";
-                if (!RunMageTool(fileArgs, f, rsa, certificate, timeStampUrl))
+                if (!RunDotnetMageTool(fileArgs, f, rsa, certificate, timeStampUrl))
                 {
                     throw new Exception($"Could not sign {f}");
                 }
@@ -107,7 +150,16 @@ namespace AzureSignToolClickOnce.Services
             // rename deploy files back to original
             foreach (string filename in deployFiles)
             {
-                File.Move(filename, filename.Trim() + ".deploy");
+                string deployFileName = filename.Trim() + ".deploy";
+                
+                // If the .deploy file already exists, delete it first
+                if (File.Exists(deployFileName))
+                {
+                    Console.WriteLine($"Deploy file already exists, deleting: {deployFileName}");
+                    File.Delete(deployFileName);
+                }
+                
+                File.Move(filename, deployFileName);
             }
         }
 
@@ -131,47 +183,125 @@ namespace AzureSignToolClickOnce.Services
             }
         }
 
-        private bool RunMageTool(string args, string inputFile, RSA rsa, X509Certificate2 publicCertificate, string timestampUrl)
+        private void EnsureDotnetMageInstalled()
         {
-            var signtool = new Process
+            Console.WriteLine("Checking if dotnet-mage is installed...");
+            
+            // Check if dotnet-mage is installed
+            var checkProcess = new Process
             {
                 StartInfo =
                 {
-                    FileName = _magetoolPath,
+                    FileName = "dotnet",
+                    Arguments = "tool list --global",
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true
+                }
+            };
+
+            checkProcess.Start();
+            string output = checkProcess.StandardOutput.ReadToEnd();
+            checkProcess.WaitForExit();
+
+            if (!output.Contains("microsoft.dotnet.mage"))
+            {
+                Console.WriteLine($"dotnet-mage not found. Installing version {DotnetMageVersion}...");
+                InstallDotnetMage();
+            }
+            else
+            {
+                Console.WriteLine("dotnet-mage is already installed.");
+            }
+        }
+
+        private void InstallDotnetMage()
+        {
+            var installProcess = new Process
+            {
+                StartInfo =
+                {
+                    FileName = "dotnet",
+                    Arguments = $"tool install --global Microsoft.DotNet.Mage --version {DotnetMageVersion}",
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true
+                }
+            };
+
+            Console.WriteLine($"Running: dotnet tool install --global Microsoft.DotNet.Mage --version {DotnetMageVersion}");
+            
+            installProcess.OutputDataReceived += (sender, e) =>
+            {
+                if (!string.IsNullOrEmpty(e.Data))
+                    Console.WriteLine($"Install Output: {e.Data}");
+            };
+            
+            installProcess.ErrorDataReceived += (sender, e) =>
+            {
+                if (!string.IsNullOrEmpty(e.Data))
+                    Console.WriteLine($"Install Error: {e.Data}");
+            };
+
+            installProcess.Start();
+            installProcess.BeginOutputReadLine();
+            installProcess.BeginErrorReadLine();
+            installProcess.WaitForExit();
+
+            if (installProcess.ExitCode == 0)
+            {
+                Console.WriteLine("dotnet-mage installed successfully.");
+            }
+            else
+            {
+                throw new Exception($"Failed to install dotnet-mage. Exit code: {installProcess.ExitCode}");
+            }
+        }
+
+        private bool RunDotnetMageTool(string args, string inputFile, RSA rsa, X509Certificate2 publicCertificate, string timestampUrl)
+        {
+            var mageProcess = new Process
+            {
+                StartInfo =
+                {
+                    FileName = "dotnet",
+                    Arguments = $"mage {args}",
                     UseShellExecute = false,
                     CreateNoWindow = true,
                     RedirectStandardError = true,
-                    RedirectStandardOutput = true,
-                    Arguments = args
+                    RedirectStandardOutput = true
                 }
             };
-            Console.WriteLine($"Signing {signtool.StartInfo.FileName} {args}");
-            signtool.OutputDataReceived += (sender, e) =>
+            
+            Console.WriteLine($"Signing with dotnet-mage: {mageProcess.StartInfo.FileName} {mageProcess.StartInfo.Arguments}");
+            
+            mageProcess.OutputDataReceived += (sender, e) =>
             {
                 if (!string.IsNullOrEmpty(e.Data))
-                    Console.WriteLine($"Mage Out {e.Data}"); ;
+                    Console.WriteLine($"Mage Out: {e.Data}");
             };
-            signtool.ErrorDataReceived += (sender, e) =>
+            
+            mageProcess.ErrorDataReceived += (sender, e) =>
             {
                 if (!string.IsNullOrEmpty(e.Data))
-                    Console.WriteLine($"Mage Err {e.Data}");
+                    Console.WriteLine($"Mage Err: {e.Data}");
             };
 
-            signtool.Start();
+            mageProcess.Start();
+            mageProcess.BeginOutputReadLine();
+            mageProcess.BeginErrorReadLine();
+            mageProcess.WaitForExit();
 
-            signtool.BeginOutputReadLine();
-            signtool.BeginErrorReadLine();
-
-            signtool.WaitForExit();
-
-            if (signtool.ExitCode == 0)
+            if (mageProcess.ExitCode == 0)
             {
                 Console.WriteLine($"Manifest signing {inputFile}");
                 ManifestSigner.SignFile(inputFile, rsa, publicCertificate, timestampUrl);
                 return true;
             }
 
-            Console.WriteLine($"Error: Signtool returned {signtool.ExitCode}");
+            Console.WriteLine($"Error: dotnet-mage returned {mageProcess.ExitCode}");
             return false;
         }
     }
